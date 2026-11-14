@@ -1,0 +1,1 @@
+Artwork scan now summarizes the likely advertising theme using OCR keywords and provides evidence-strength percentages for matching exclusion rules. Percentages are heuristic relevance indicators, not calibrated probabilities of exclusion or approval. OCR cannot recognize visual imagery. Manual review required.

@@ -314,6 +314,110 @@ function vcFindMatches(d,venues,industries,ocrText){
  const hits=applicable.map(entry=>({...entry,terms:vcTerms(entry.rule).filter(term=>(' '+text+' ').includes(' '+term+' '))})).filter(entry=>entry.terms.length);
  return {hits,unknown,matched};
 }
+
+// Rule-based evidence strength, not a statistical probability of exclusion.
+const VC_THEMES=[
+ ['Medical & wellness services',[['clinic',2],['medical',2],['healthcare',2],['patient',2],['treatment',2],['therapy',2],['wellness',2],['appointment',1],['doctor',2],['physician',2]]],
+ ['Weight-loss products & services',[['weight loss',4],['semaglutide',4],['ozempic',4],['wegovy',4],['tirzepatide',4],['slimming',2],['lose weight',3]]],
+ ['Restaurants & food services',[['restaurant',4],['order online',2],['menu',2],['dine in',3],['takeout',3],['pizza',3],['catering',3],['food delivery',3]]],
+ ['Alcohol products & sales',[['beer',3],['wine',3],['liquor',4],['cocktails',3],['spirits',3],['brewery',3]]],
+ ['Cannabis & smoking products',[['cannabis',4],['marijuana',4],['dispensary',4],['thc',4],['vape',3],['tobacco',3]]],
+ ['Gambling & betting',[['casino',4],['sports betting',4],['wager',3],['lottery',4],['jackpot',2],['gambling',4]]],
+ ['Legal services',[['attorney',4],['law firm',4],['lawyer',4],['legal services',3],['personal injury',3],['slip and fall',4]]],
+ ['Retail & shopping',[['shop now',2],['store',1],['sale',1],['retail',3],['buy online',2],['discount',1]]],
+ ['Employment & recruitment',[['we are hiring',4],['apply now',2],['job openings',4],['careers',3],['recruitment',3]]],
+ ['Financial services',[['bank',3],['mortgage',3],['loan',3],['credit union',4],['insurance',3]]],
+ ['Religious organizations',[['church',4],['ministry',4],['worship',3],['religious',3]]],
+ ['Pet services & supplies',[['pet food',4],['pet supplies',4],['veterinary',3],['grooming',3],['dog',1],['cat',1]]]
+];
+function vcHasPhrase(normalized,phrase){return (' '+normalized+' ').includes(' '+norm(phrase)+' ')}
+function vcThemeAnalysis(ocrText,company,industries){
+ const raw=String(ocrText||'').trim();const words=norm(raw);
+ const themes=VC_THEMES.map(([name,patterns])=>{const evidence=patterns.filter(([term])=>vcHasPhrase(words,term));return {name,score:evidence.reduce((a,p)=>a+p[1],0),terms:evidence.map(p=>p[0])}}).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
+ const primary=themes[0];const supporting=themes.slice(1,3);
+ const sentences=raw.split(/(?<=[.!?])\s+|\n+/).map(x=>x.trim()).filter(x=>x.length>12&&x.length<260);
+ const sample=primary?sentences.filter(s=>primary.terms.some(t=>vcHasPhrase(norm(s),t))).slice(0,2):sentences.slice(0,2);
+ const summary=primary?'The artwork appears to promote '+primary.name.toLowerCase()+'. '+(supporting.length?'Additional signals suggest '+supporting.map(x=>x.name.toLowerCase()).join(' and ')+'. ':'')+'This interpretation is based on detected artwork words, not visual recognition.':
+   (raw?'The artwork text does not clearly establish a business category. Review the full image and advertiser details.':'No readable artwork text was found. The advertising subject cannot be determined from OCR.');
+ return {summary,primary, supporting, sample, themes};
+}
+function vcOcrReliability(text,ocrConfidence){
+ const words=String(text||'').trim().split(/\s+/).filter(Boolean);
+ const readable=words.filter(w=>/[a-zA-Z]{3}/.test(w)).length;
+ const coverage=words.length?readable/words.length:0;
+ const lengthFactor=Math.min(1,words.length/25);
+ const proxy=Math.round(100*(0.65*coverage+0.35*lengthFactor));
+ const engine=Number.isFinite(Number(ocrConfidence))&&ocrConfidence!==null?Math.max(0,Math.min(100,Math.round(Number(ocrConfidence)))):null;
+ return {score:engine===null?proxy:Math.round(engine*.7+proxy*.3),engine,words:words.length,estimate:engine===null};
+}
+function vcRuleException(entry,artwork){
+ const description=norm(entry.rule[1]||''),title=norm(entry.rule[0]||'');
+ const exceptions=[
+  {rule:'massage',terms:['therapeutic massage','spa type massage','physical therapy','rehabilitation']},
+  {rule:'gas station',terms:['auto repair','car repair','vehicle repair','oil change','smog certification']},
+  {rule:'attorney',terms:['family law','divorce','immigration','bankruptcy','estate planning','wills','trusts']},
+  {rule:'chiropractor',terms:['licensed chiropractor']},
+  {rule:'pet',terms:['pet grooming','dog grooming','veterinary services']}
+ ];
+ return exceptions.filter(x=>title.includes(x.rule)&&x.terms.some(t=>vcHasPhrase(artwork,t))&&
+   (description.includes('permit')||description.includes('ok')||description.includes('service'))).map(x=>x.terms.filter(t=>vcHasPhrase(artwork,t))).flat();
+}
+function vcScoreBand(score){return score>=85?'Strong evidence':score>=65?'Likely match':score>=40?'Possible match':'Weak evidence'}
+function vcEvidenceMatches(d,venues,industries,ocrText,analysis){
+ const names=(venues&&venues.length?venues:(d.__venues||[])).filter(Boolean),matched=[],unknown=[];
+ for(const name of names){const v=matchVenue(name);if(v){if(!matched.includes(v))matched.push(v)}else if(!unknown.includes(name))unknown.push(name)}
+ const applicable=[...RULES.general.map(rule=>({rule,scope:'General'}))];
+ matched.forEach(v=>(v.exclusions||[]).forEach(rule=>applicable.push({rule,scope:v.venue+' — venue specific'})));
+ const artwork=norm(ocrText),metadata=norm([d['Company Name']||'',...(industries||[])].join(' '));
+ const entries=applicable.map(entry=>{
+  const terms=vcTerms(entry.rule),art=terms.filter(t=>vcHasPhrase(artwork,t)),meta=terms.filter(t=>vcHasPhrase(metadata,t));
+  const title=norm(entry.rule[0]),desc=norm(entry.rule[1]||'');
+  const direct=vcHasPhrase(artwork,title);
+  const thematic=analysis.themes.filter(t=>t.score>=3&&t.terms.some(term=>vcHasPhrase(title,term)));
+  const context=art.length>1||art.some(t=>t.split(' ').length>1);
+  const exception=vcRuleException(entry,artwork);
+  // Explicit evidence categories; scores are heuristic relevance, NOT probabilities.
+  const components={exact:direct?35:art.length?Math.min(25,12+art.length*6):0,
+   theme:thematic.length?Math.min(25,10+thematic[0].score*2):0,
+   context:context?20:art.length?8:0,
+   terminology:Math.min(10,Math.max(0,art.length-1)*5+Math.min(5,meta.length*2)),
+   venue:entry.scope==='General'?5:10};
+  // Venue points only count when there is actual rule evidence.
+  let score=components.exact+components.theme+components.context+components.terminology;
+  if(score>0)score+=components.venue;
+  if(!art.length)score=Math.min(score,meta.length?30:0);
+  if(exception.length)score=Math.min(score,39);
+  score=Math.min(100,Math.round(score));
+  return {...entry,score,art,meta,theme:thematic,exception,components};
+ }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
+ return {hits:entries,unknown,matched};
+}
+function vcFeedbackKey(d,h){return 'vc-review:'+norm(d['Company Name']||'')+':'+norm(h.scope)+':'+norm(h.rule[0])}
+function vcRenderThemeAndMatches(d,venues,industries,ocrText,ocrConfidence){
+ const analysis=vcThemeAnalysis(ocrText,d['Company Name'],industries),{hits,unknown}=vcEvidenceMatches(d,venues,industries,ocrText,analysis);
+ const reliability=vcOcrReliability(ocrText,ocrConfidence);
+ const caution=reliability.words<5?'Very little readable text was extracted. ':'';
+ const matches=hits.map(h=>{
+  let feedback='';try{feedback=localStorage.getItem(vcFeedbackKey(d,h))||''}catch(_){}
+  const key=encodeURIComponent(vcFeedbackKey(d,h));
+  return '<div class="vc-match"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><strong>'+esc(h.rule[0])+'</strong><strong style="color:#7d285f">'+h.score+'% · '+vcScoreBand(h.score)+'</strong></div><div class="vc-source">'+esc(h.scope)+'</div>'+
+   (h.rule[1]?'<div>'+esc(h.rule[1])+'</div>':'')+
+   '<div class="vc-source">'+(h.art.length?'Artwork: '+esc(h.art.join(', '))+'. ':'')+(h.meta.length?'Company/industry: '+esc(h.meta.join(', '))+'. ':'')+(h.theme.length?'Theme: '+esc(h.theme.map(x=>x.name).join(', '))+'. ':'')+'</div>'+
+   (h.exception.length?'<p class="vc-note"><strong>Possible permitted exception:</strong> '+esc(h.exception.join(', '))+'. Manual interpretation required; score capped.</p>':'')+
+   '<div class="vc-source">Score components: exact '+h.components.exact+'/35, theme '+h.components.theme+'/25, context '+h.components.context+'/20, terms '+h.components.terminology+'/10, venue '+(h.score? h.components.venue:0)+'/10 (exceptions and metadata caps may apply).</div>'+
+   '<div class="vc-source">Review result: <select class="vc-review-feedback" data-key="'+key+'" aria-label="Reviewer decision"><option value="">Not reviewed</option><option value="correct"'+(feedback==='correct'?' selected':'')+'>Correct exclusion</option><option value="incorrect"'+(feedback==='incorrect'?' selected':'')+'>Incorrect exclusion</option><option value="review"'+(feedback==='review'?' selected':'')+'>Needs further review</option></select></div></div>';
+ }).join('');
+ return '<h3 style="margin:0 0 9px;color:#7d285f">Artwork advertising summary</h3><p>'+esc(analysis.summary)+'</p>'+
+ (analysis.primary?'<p class="vc-note"><strong>Primary category:</strong> '+esc(analysis.primary.name)+' · <strong>Theme signals:</strong> '+esc(analysis.primary.terms.join(', '))+'</p>':'')+
+ (analysis.sample.length?'<p class="vc-note"><strong>Supporting excerpts:</strong> '+esc(analysis.sample.join(' | ').slice(0,500))+'</p>':'')+
+ '<p class="vc-note"><strong>Theme evidence:</strong> '+(analysis.primary?Math.min(100,Math.round(analysis.primary.score/12*100))+'% (keyword coverage, not AI understanding)':'Insufficient text')+' · <strong>OCR reliability:</strong> '+reliability.score+'% ('+(reliability.estimate?'text-quality estimate':'OCR engine confidence + text quality')+'). '+esc(caution)+'</p>'+
+ '<p class="vc-note"><strong>Exclusion match strength:</strong> weighted 0–100% evidence score. Percentages are <strong>not calibrated probabilities</strong> of venue rejection. A weak/no match is never clearance; image-only content and venue conditions require human review.</p>'+
+ (hits.length?matches:'<p class="vc-note">No text-supported exclusion match detected. This does not mean the advertisement is compliant.</p>')+
+ (unknown.length?'<p class="vc-note"><strong>Unmapped venues:</strong> '+esc(unknown.join(', '))+'</p>':'')+
+ '<details><summary>View raw OCR text</summary><div class="vc-ocr-text">'+esc(String(ocrText||'').slice(0,4500)||'No readable text found')+'</div></details>'+
+ '<p class="vc-note">Reviewer decisions are saved in this browser only. They do not automatically train the scanner or sync between devices.</p>';
+}
+
 function vcStatus(el,message){const status=el.querySelector('.vc-scan-status');if(status)status.textContent=message;}
 async function vcRetrieveArtwork(url){
  // Direct CORS fetch is preferable where the artwork host permits it.
@@ -346,7 +450,9 @@ async function vcScan(button){
  button.disabled=true;result.innerHTML='';
  try{
   vcStatus(el,'Loading OCR engine…');await vcLoadOcr();
-  let text=VC_OCR_CACHE.get(url);
+  let cached=VC_OCR_CACHE.get(url);
+  let text=cached&&typeof cached==='object'?cached.text:cached;
+  let ocrConfidence=cached&&typeof cached==='object'?cached.confidence:null;
   if(text===undefined){
    vcStatus(el,'Retrieving artwork…');
    const blob=await vcRetrieveArtwork(url);
@@ -355,17 +461,15 @@ async function vcScan(button){
    try{
     vcStatus(el,'Reading text from artwork…');
     const worker=await Tesseract.createWorker('eng');
-    try{const data=await worker.recognize(localUrl);text=(data.data&&data.data.text)||''}finally{await worker.terminate()}
+    try{const data=await worker.recognize(localUrl);text=(data.data&&data.data.text)||'';ocrConfidence=data.data&&Number.isFinite(data.data.confidence)?data.data.confidence:null}finally{await worker.terminate()}
    }finally{URL.revokeObjectURL(localUrl)}
-   VC_OCR_CACHE.set(url,text);
+   VC_OCR_CACHE.set(url,{text,confidence:ocrConfidence});
   }
   const d={ 'Company Name':el.dataset.company||'',__venues:JSON.parse(el.dataset.venues||'[]')};
   const venues=d.__venues, industries=JSON.parse(el.dataset.industries||'[]');
-  const {hits,unknown}=vcFindMatches(d,venues,industries,text);
-  const matched=hits.map(({rule,scope,terms})=>'<div class="vc-match">'+ruleHtml(rule,scope)+'<div class="vc-source">Matched: '+esc(terms.join(', '))+'</div></div>').join('');
-  result.innerHTML='<h3 style="margin:0 0 9px;color:#7d285f">Artwork exclusion analysis</h3><p class="vc-note"><strong>OCR text detected:</strong></p><div class="vc-ocr-text">'+(text.trim()?esc(text.slice(0,2400)):'No readable text found')+'</div>'+ 
-   (hits.length?'<strong>'+hits.length+' potential exclusion match(es) — manual verification required</strong>'+matched:'<p class="vc-note">No keyword matches found. This does not mean the artwork is compliant; images, logos, and OCR errors may hide restricted content.</p>')+
-   (unknown.length?'<p class="vc-note">Unmapped venue(s): '+esc(unknown.join(', '))+'</p>':'');
+  const rendered=vcRenderThemeAndMatches(d,venues,industries,text,ocrConfidence);
+  result.innerHTML=rendered;
+  const {hits}=vcEvidenceMatches(d,venues,industries,text,vcThemeAnalysis(text,d['Company Name'],industries));
   vcStatus(el,'Scan completed. '+hits.length+' possible match(es).');
  }catch(err){
   // An unavailable image is not a failure of the venue rules. Still screen the
@@ -383,6 +487,7 @@ async function vcScan(button){
  finally{button.disabled=false}
 }
 document.addEventListener('click',event=>{const button=event.target.closest('.vc-scan-button');if(button)vcScan(button)});
+document.addEventListener('change',event=>{const el=event.target.closest('.vc-review-feedback');if(!el)return;try{const key=decodeURIComponent(el.dataset.key);if(el.value)localStorage.setItem(key,el.value);else localStorage.removeItem(key)}catch(_){}});
 
 })();
 </script>
