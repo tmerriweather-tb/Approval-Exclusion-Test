@@ -331,7 +331,19 @@ async function vcScan(button){
    (hits.length?'<strong>'+hits.length+' potential exclusion match(es) — manual verification required</strong>'+matched:'<p class="vc-note">No keyword matches found. This does not mean the artwork is compliant; images, logos, and OCR errors may hide restricted content.</p>')+
    (unknown.length?'<p class="vc-note">Unmapped venue(s): '+esc(unknown.join(', '))+'</p>':'');
   vcStatus(el,'Scan completed. '+hits.length+' possible match(es).');
- }catch(err){vcStatus(el,'Scan failed: '+(err&&err.message||'Unknown error')+'. You can still review exclusions manually.');}
+ }catch(err){
+  // An unavailable image is not a failure of the venue rules. Still screen the
+  // advertiser name and industry, and clearly mark artwork as NOT REVIEWED.
+  const d={'Company Name':el.dataset.company||'',__venues:JSON.parse(el.dataset.venues||'[]')};
+  const industries=JSON.parse(el.dataset.industries||'[]');
+  const {hits,unknown}=vcFindMatches(d,d.__venues,industries,'');
+  result.innerHTML='<h3 style="margin:0 0 9px;color:#7d285f">Preliminary exclusion review</h3>'+
+   '<p class="vc-note"><strong>Artwork could not be read.</strong> '+esc(err&&err.message||'Image unavailable')+'</p>'+
+   '<p class="vc-note">The following results use advertiser name and industry only. Artwork text, images and logos have NOT been checked.</p>'+
+   (hits.length?hits.map(({rule,scope,terms})=>'<div class="vc-match">'+ruleHtml(rule,scope)+'<div class="vc-source">Matched: '+esc(terms.join(', '))+'</div></div>').join(''):'<p class="vc-note">No preliminary text matches. This is NOT an approval or compliance clearance.</p>')+
+   (unknown.length?'<p class="vc-note">Unmapped venue(s): '+esc(unknown.join(', '))+'</p>':'');
+  vcStatus(el,'Artwork unavailable — preliminary review completed; manual artwork review required.');
+ }
  finally{button.disabled=false}
 }
 document.addEventListener('click',event=>{const button=event.target.closest('.vc-scan-button');if(button)vcScan(button)});
